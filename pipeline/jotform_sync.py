@@ -691,15 +691,16 @@ def run_sync(full: bool = False):
 
         # ── Batch upsert incidents ───────────────────────────────────────
         try:
-            new, updated = batch_upsert_incidents(conn, rows)
-            counts['new']     += new
-            counts['updated'] += updated
+            batch_new, batch_updated = batch_upsert_incidents(conn, rows)
+            counts['new']     += batch_new
+            counts['updated'] += batch_updated
             conn.commit()
         except Exception as e:
             conn.rollback()
             counts['errors'] += len(rows)
             log.error('BATCH UPSERT ERROR (offset %d): %s', batch_start, e)
             continue
+        new, updated = batch_new, batch_updated
 
         # ── Batch upsert media + sources ─────────────────────────────────
         jotform_ids = [r['jotform_submission_id'] for r in rows if 'jotform_submission_id' in r]
