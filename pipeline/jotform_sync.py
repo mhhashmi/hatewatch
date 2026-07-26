@@ -44,7 +44,7 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('sync.log'),
+        logging.FileHandler('logs/sync.log'),
     ],
 )
 log = logging.getLogger(__name__)

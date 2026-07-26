@@ -8,3 +8,18 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Logs and reports
+logs/
+reports/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# Temp files
+*.tmp
+*.bak
