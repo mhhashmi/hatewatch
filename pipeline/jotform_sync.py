@@ -44,7 +44,7 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('logs/sync.log'),
+        logging.FileHandler('sync.log'),
     ],
 )
 log = logging.getLogger(__name__)
@@ -535,98 +535,111 @@ def get_connection():
 def get_last_synced_id(conn) -> Optional[str]:
     with conn.cursor() as cur:
         cur.execute(
-            'SELECT last_submission_id FROM jotform_sync_log '
-            'ORDER BY synced_at DESC LIMIT 1'
+            """SELECT last_submission_id FROM jotform_sync_log
+               WHERE sync_type = 'incremental'
+               AND new_records > 0
+               ORDER BY synced_at DESC LIMIT 1"""
         )
         row = cur.fetchone()
         return row[0] if row else None
 
 
-def upsert_incident(conn, row: dict) -> tuple[bool, bool]:
+def batch_upsert_incidents(conn, rows: list[dict]) -> tuple[int, int]:
     """
-    Insert or update an incident row.
-    Returns (is_new, is_updated).
+    Batch upsert a list of incident rows in a single round-trip.
+    Returns (new_count, updated_count).
     """
-    cols   = list(row.keys())
-    vals   = [row[c] for c in cols]
-    ph     = [f'%s' for _ in cols]
+    if not rows:
+        return 0, 0
 
-    # Build UPDATE set — exclude identifiers
-    update_cols = [c for c in cols if c != 'jotform_submission_id']
+    # All rows must have the same columns — use union of all keys
+    all_cols = list({col for row in rows for col in row.keys()})
+    # Ensure jotform_submission_id is always present
+    if 'jotform_submission_id' not in all_cols:
+        all_cols.append('jotform_submission_id')
+
+    update_cols = [c for c in all_cols if c != 'jotform_submission_id']
     update_set  = ', '.join(f'{c} = EXCLUDED.{c}' for c in update_cols)
+    ph          = ', '.join(['%s'] * len(all_cols))
+    col_str     = ', '.join(all_cols)
 
     sql = f"""
-        INSERT INTO incidents ({', '.join(cols)})
-        VALUES ({', '.join(ph)})
+        INSERT INTO incidents ({col_str})
+        VALUES ({ph})
         ON CONFLICT (jotform_submission_id)
         DO UPDATE SET {update_set},
                       updated_at = NOW()
-        RETURNING (xmax = 0) AS is_insert
+        RETURNING id, (xmax = 0) AS is_insert
     """
 
+    # Build value tuples — fill missing cols with None
+    val_tuples = [
+        tuple(row.get(col) for col in all_cols)
+        for row in rows
+    ]
+
     with conn.cursor() as cur:
-        cur.execute(sql, vals)
-        result = cur.fetchone()
-        is_new = result[0] if result else False
-        return is_new, not is_new
+        psycopg2.extras.execute_batch(cur, sql, val_tuples, page_size=100)
+        results = cur.fetchall()
+
+    new     = sum(1 for _, is_ins in results if is_ins)
+    updated = sum(1 for _, is_ins in results if not is_ins)
+    return new, updated
 
 
-def get_incident_id(conn, jotform_submission_id: str) -> Optional[int]:
+def get_incident_ids_by_jotform(conn, jotform_ids: list[str]) -> dict[str, int]:
+    """Return {jotform_submission_id: incidents.id} for a list of jotform IDs."""
+    if not jotform_ids:
+        return {}
     with conn.cursor() as cur:
         cur.execute(
-            'SELECT id FROM incidents WHERE jotform_submission_id = %s',
-            (jotform_submission_id,)
+            'SELECT jotform_submission_id, id FROM incidents WHERE jotform_submission_id = ANY(%s)',
+            (jotform_ids,)
         )
-        row = cur.fetchone()
-        return row[0] if row else None
+        return {row[0]: row[1] for row in cur.fetchall()}
 
 
-def upsert_media_files(conn, incident_id: int, media: dict, jotform_sub_id: str):
-    """Insert media file rows — skip if URL already exists for this incident."""
-    with conn.cursor() as cur:
-        for url in media.get('image_urls', []):
-            if not url:
-                continue
-            cur.execute("""
-                INSERT INTO media_files
-                    (incident_id, file_type, original_url, archived, platform, data_source)
-                VALUES (%s, 'image', %s, FALSE, %s, 'jotform')
-                ON CONFLICT DO NOTHING
-            """, (incident_id, url, detect_platform(url)))
-
-        for url in media.get('video_urls', []):
-            if not url:
-                continue
-            cur.execute("""
-                INSERT INTO media_files
-                    (incident_id, file_type, original_url, archived, platform, data_source)
-                VALUES (%s, 'video', %s, FALSE, %s, 'jotform')
-                ON CONFLICT DO NOTHING
-            """, (incident_id, url, detect_platform(url)))
+def batch_upsert_media_files(conn, media_rows: list[tuple]):
+    """Batch insert media files. Each tuple: (incident_id, file_type, url, platform)"""
+    if not media_rows:
+        return
+    psycopg2.extras.execute_batch(
+        conn.cursor(),
+        """
+        INSERT INTO media_files
+            (incident_id, file_type, original_url, archived, platform, data_source)
+        VALUES (%s, %s, %s, FALSE, %s, 'jotform')
+        ON CONFLICT DO NOTHING
+        """,
+        media_rows,
+        page_size=200,
+    )
 
 
-def upsert_sources(conn, incident_id: int, website_urls: list):
-    """Insert source rows for website links."""
-    with conn.cursor() as cur:
-        for url in website_urls:
-            if not url:
-                continue
-            cur.execute("""
-                INSERT INTO sources
-                    (incident_id, source_type, url, reliability)
-                VALUES (%s, 'news_article', %s, 'unverified')
-                ON CONFLICT DO NOTHING
-            """, (incident_id, url))
+def batch_upsert_sources(conn, source_rows: list[tuple]):
+    """Batch insert sources. Each tuple: (incident_id, url)"""
+    if not source_rows:
+        return
+    psycopg2.extras.execute_batch(
+        conn.cursor(),
+        """
+        INSERT INTO sources (incident_id, source_type, url, reliability)
+        VALUES (%s, 'news_article', %s, 'unverified')
+        ON CONFLICT DO NOTHING
+        """,
+        source_rows,
+        page_size=200,
+    )
 
 
-def log_sync_run(conn, last_id, fetched, new, updated, errors, duration):
+def log_sync_run(conn, last_id, fetched, new, updated, errors, duration, sync_type='incremental'):
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO jotform_sync_log
                 (last_submission_id, fetched, new_records, updated_records,
                  errors, duration_seconds, sync_type)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (last_id, fetched, new, updated, errors, duration, 'incremental'))
+        """, (last_id, fetched, new, updated, errors, duration, sync_type))
     conn.commit()
 
 
@@ -652,45 +665,82 @@ def run_sync(full: bool = False):
     submissions = fetch_submissions(since_id=since_id)
     log.info('Total submissions to process: %d', len(submissions))
 
-    counts = {'fetched': len(submissions), 'new': 0, 'updated': 0, 'errors': 0}
+    counts  = {'fetched': len(submissions), 'new': 0, 'updated': 0, 'errors': 0}
     last_id = since_id
+    BATCH   = 100  # records per DB round-trip
 
-    for sub in submissions:
-        sub_id = sub.get('id')
+    for batch_start in range(0, len(submissions), BATCH):
+        batch = submissions[batch_start:batch_start + BATCH]
+        rows, media_map = [], {}
+
+        # ── Map all submissions in this batch ────────────────────────────
+        for sub in batch:
+            sub_id = sub.get('id')
+            try:
+                answers    = extract_answers(sub)
+                row, media = map_submission(sub, answers)
+                rows.append(row)
+                media_map[sub_id] = media
+                last_id = sub_id
+            except Exception as e:
+                counts['errors'] += 1
+                log.error('MAP ERROR on submission %s: %s', sub_id, e)
+
+        if not rows:
+            continue
+
+        # ── Batch upsert incidents ───────────────────────────────────────
         try:
-            answers    = extract_answers(sub)
-            row, media = map_submission(sub, answers)
-
-            is_new, is_updated = upsert_incident(conn, row)
+            new, updated = batch_upsert_incidents(conn, rows)
+            counts['new']     += new
+            counts['updated'] += updated
             conn.commit()
-
-            incident_id = get_incident_id(conn, sub_id)
-            if incident_id:
-                upsert_media_files(conn, incident_id, media, sub_id)
-                upsert_sources(conn, incident_id, media.get('website_urls', []))
-                conn.commit()
-
-            if is_new:
-                counts['new'] += 1
-                log.debug('NEW     submission %s', sub_id)
-            elif is_updated:
-                counts['updated'] += 1
-                log.debug('UPDATED submission %s', sub_id)
-
-            last_id = sub_id
-
         except Exception as e:
             conn.rollback()
-            counts['errors'] += 1
-            log.error('ERROR on submission %s: %s', sub_id, e, exc_info=True)
+            counts['errors'] += len(rows)
+            log.error('BATCH UPSERT ERROR (offset %d): %s', batch_start, e)
             continue
+
+        # ── Batch upsert media + sources ─────────────────────────────────
+        jotform_ids = [r['jotform_submission_id'] for r in rows if 'jotform_submission_id' in r]
+        id_map      = get_incident_ids_by_jotform(conn, jotform_ids)
+
+        media_rows  = []
+        source_rows = []
+        for sub_id, media in media_map.items():
+            inc_id = id_map.get(sub_id)
+            if not inc_id:
+                continue
+            for url in media.get('image_urls', []):
+                if url:
+                    media_rows.append((inc_id, 'image', url, detect_platform(url)))
+            for url in media.get('video_urls', []):
+                if url:
+                    media_rows.append((inc_id, 'video', url, detect_platform(url)))
+            for url in media.get('website_urls', []):
+                if url:
+                    source_rows.append((inc_id, url))
+
+        try:
+            batch_upsert_media_files(conn, media_rows)
+            batch_upsert_sources(conn, source_rows)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            log.error('MEDIA/SOURCE BATCH ERROR (offset %d): %s', batch_start, e)
+
+        log.info(
+            'Processed batch %d–%d: +%d new, ~%d updated',
+            batch_start + 1, batch_start + len(batch), new, updated
+        )
 
     duration = (datetime.now(timezone.utc) - start).total_seconds()
 
     log_sync_run(
         conn, last_id,
         counts['fetched'], counts['new'], counts['updated'],
-        counts['errors'], duration
+        counts['errors'], duration,
+        sync_type='full' if full else 'incremental'
     )
 
     log.info(
