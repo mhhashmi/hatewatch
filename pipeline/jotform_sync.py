@@ -333,6 +333,51 @@ def parse_geolocation(raw: str):
     return lat, lng
 
 
+# India state code → full name mapping
+INDIA_STATE_CODES = {
+    'AP': 'Andhra Pradesh', 'AR': 'Arunachal Pradesh', 'AS': 'Assam',
+    'BR': 'Bihar', 'CG': 'Chhattisgarh', 'GA': 'Goa', 'GJ': 'Gujarat',
+    'HR': 'Haryana', 'HP': 'Himachal Pradesh', 'JH': 'Jharkhand',
+    'KA': 'Karnataka', 'KL': 'Kerala', 'MP': 'Madhya Pradesh',
+    'MH': 'Maharashtra', 'MN': 'Manipur', 'ML': 'Meghalaya',
+    'MZ': 'Mizoram', 'NL': 'Nagaland', 'OD': 'Odisha', 'OR': 'Odisha',
+    'PB': 'Punjab', 'RJ': 'Rajasthan', 'SK': 'Sikkim', 'TN': 'Tamil Nadu',
+    'TS': 'Telangana', 'TR': 'Tripura', 'UP': 'Uttar Pradesh',
+    'UK': 'Uttarakhand', 'WB': 'West Bengal', 'DL': 'Delhi',
+    'JK': 'Jammu & Kashmir', 'LA': 'Ladakh', 'PY': 'Puducherry',
+    'CH': 'Chandigarh', 'AN': 'Andaman & Nicobar', 'DN': 'Dadra & Nagar Haveli',
+    'DD': 'Daman & Diu', 'LD': 'Lakshadweep',
+}
+
+def parse_address_block(address: str) -> dict:
+    """
+    Parse JotForm address block format:
+      'City: Sonipat\nState: HR'
+    Returns dict with city, state, postal_code where found.
+    """
+    result = {}
+    if not address:
+        return result
+    for line in address.split('\n'):
+        line = line.strip()
+        if ':' not in line:
+            continue
+        key, _, val = line.partition(':')
+        key = key.strip().lower()
+        val = val.strip()
+        if not val:
+            continue
+        if key == 'city':
+            result['city'] = val
+        elif key == 'state':
+            # Expand state code to full name if needed
+            result['state'] = INDIA_STATE_CODES.get(val.upper(), val)
+            result['state_code'] = val.upper()[:2]
+        elif key in ('postal code', 'postal_code', 'zip', 'pincode'):
+            result['postal_code'] = val
+    return result
+
+
 def detect_platform(url: str) -> str:
     if not url:
         return 'unknown'
@@ -449,6 +494,12 @@ def map_submission(sub: dict, answers: dict) -> tuple[dict, dict]:
     row['submission_date']       = sub.get('created_at')
     row['last_updated']          = sub.get('updated_at')
 
+    # JotForm workflow approval status lives in submission.status, not answers
+    # Values: ACTIVE (in progress), APPROVED, DENIED
+    jotform_status = sub.get('status', '')
+    if not row.get('approval_status_raw'):
+        row['approval_status_raw'] = jotform_status
+
     # ── Normalise dates ───────────────────────────────────────────────────
     row['incident_date']       = to_date(row.pop('incident_date',       None))
     row['fir_filed_date']      = to_date(row.pop('fir_filed_date',      None))
@@ -495,9 +546,31 @@ def map_submission(sub: dict, answers: dict) -> tuple[dict, dict]:
             row['latitude']  = lat
             row['longitude'] = lng
 
+    # ── Parse address block for city/state/postal_code ─────────────────
+    address_raw = row.get('address', '')
+    if address_raw:
+        parsed = parse_address_block(str(address_raw))
+        # Only fill in if not already set from direct field mapping
+        if parsed.get('city') and not row.get('city'):
+            row['city'] = parsed['city']
+        if parsed.get('state') and not row.get('state'):
+            row['state'] = parsed['state']
+        if parsed.get('state_code') and not row.get('state_code'):
+            row['state_code'] = parsed['state_code']
+        if parsed.get('postal_code') and not row.get('postal_code'):
+            row['postal_code'] = parsed['postal_code']
+
     # ── Extract URLs from description ────────────────────────────────────
     desc_urls = extract_urls_from_text(row.get('description', ''))
     media['website_urls'].extend(desc_urls)
+
+    # ── Normalise state — expand abbreviations to full names ────────────
+    if row.get('state'):
+        state_val = str(row['state']).strip()
+        # If it looks like a 2-letter code, expand it
+        if len(state_val) <= 3:
+            row['state'] = INDIA_STATE_CODES.get(state_val.upper(), state_val)
+            row['state_code'] = state_val.upper()[:2]
 
     # ── Provenance — set automatically for all JotForm records ───────────
     row['data_source']          = 'jotform'
