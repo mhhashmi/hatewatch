@@ -44,7 +44,7 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('sync.log'),
+        logging.FileHandler('logs/sync.log'),
     ],
 )
 log = logging.getLogger(__name__)
@@ -169,13 +169,17 @@ INCIDENT_COLUMNS = {
     # identifiers
     'jotform_submission_id',
     # core
+    'title',
     'incident_type', 'incident_severity', 'bias_motivation',
     'nature_of_incident', 'description', 'tags',
     'incident_date', 'incident_date_approx',
+    # motive
+    'motive_cause', 'other_motive',
     # location
-    'address', 'city', 'district', 'state', 'state_code',
+    'address', 'street', 'house_number',
+    'city', 'district', 'state', 'state_code',
     'postal_code', 'latitude', 'longitude',
-    'type_of_venue', 'type_of_discrimination',
+    'type_of_venue', 'other_venue_type', 'type_of_discrimination',
     # victim
     'casualties', 'injured', 'displaced', 'harassed',
     'property_damage', 'online_harassment', 'online_harassment_detail',
@@ -187,12 +191,16 @@ INCIDENT_COLUMNS = {
     'fir_status', 'fir_number', 'fir_filed_date', 'fir_filed_against',
     'police_station', 'ps_code', 'police_role',
     'investigating_agency', 'other_investigating_agency', 'investigating_officer',
-    'case_current_status', 'fir_charges', 'hate_crime_included',
+    'case_current_status', 'other_current_status',
+    'fir_charges', 'hate_crime_included',
     # cross FIR
     'cross_fir_filed', 'cross_fir_filed_date',
     'cross_fir_filed_against', 'cross_fir_charges',
     # political context
-    'state_government_party',
+    'state_government_party', 'other_state_party',
+    # source / reporter metadata
+    'source_of_information', 'other_source', 'source_app',
+    'image_source', 'video_source', 'images_by', 'video_by',
     # raw / metadata
     'geolocation_raw', 'submission_ip', 'approval_status',
     # provenance (set automatically)
